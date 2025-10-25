@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dirshot"
-version = "0.1.0"
+version = "0.1.1"
 authors = [
   { name="init-helpful", email="init.helpful@gmail.com" },
 ]
@@ -21,5 +21,5 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/yourusername/dirshot"
-"Bug Tracker" = "https://github.com/yourusername/dirshot/issues"
+"Homepage" = "https://github.com/init-helpful/dirshot"
+"Bug Tracker" = "https://github.com/init-helpful/dirshot/issues"
