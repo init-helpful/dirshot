@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import time  # Imported for the fallback progress bar
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional, Set, Tuple, Callable, NamedTuple, Dict, Any
@@ -13,21 +14,70 @@ try:
     from tqdm import tqdm
 except ImportError:
 
+    # Define a functional fallback dummy tqdm class if the import fails.
     class tqdm:
-        def __init__(self, iterable=None, **kwargs):
+        """A simple, text-based progress bar fallback if tqdm is not installed."""
+
+        def __init__(self, iterable=None, total=None, desc="", unit="it", **kwargs):
             self.iterable = iterable
+            self.total = (
+                total
+                if total is not None
+                else (len(iterable) if hasattr(iterable, "__len__") else None)
+            )
+            self.desc = desc
+            self.unit = unit
+            self.current = 0
+            self.start_time = time.time()
+            self._last_update_time = 0
 
         def __iter__(self):
-            return iter(self.iterable)
+            for obj in self.iterable:
+                yield obj
+                self.update(1)
+            # The loop is finished, ensure the bar is 100% and close
+            if self.total is not None and self.current < self.total:
+                self.update(self.total - self.current)
+            self.close()
 
         def update(self, n=1):
-            pass
+            """Update the progress bar by n steps."""
+            self.current += n
+            now = time.time()
+            # Throttle screen updates to prevent flickering and performance loss
+            if (
+                self.total is None
+                or now - self._last_update_time > 0.1
+                or self.current == self.total
+            ):
+                self._last_update_time = now
+                self._draw()
 
-        def set_description(self, desc):
-            pass
+        def set_description(self, desc: str):
+            """Set the description of the progress bar."""
+            self.desc = desc
+            self._draw()
+
+        def _draw(self):
+            """Draw the progress bar to the console."""
+            if self.total:
+                percent = int((self.current / self.total) * 100)
+                bar_length = 25
+                filled_length = int(bar_length * self.current // self.total)
+                bar = "█" * filled_length + "-" * (bar_length - filled_length)
+                # Use carriage return to print on the same line
+                progress_line = f"\r{self.desc}: {percent}%|{bar}| {self.current}/{self.total} [{self.unit}]"
+                sys.stdout.write(progress_line)
+            else:  # Case where total is not known
+                sys.stdout.write(f"\r{self.desc}: {self.current} {self.unit}")
+
+            sys.stdout.flush()
 
         def close(self):
-            pass
+            """Clean up the progress bar line."""
+            # Print a newline to move off the progress bar line
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
 
 # --- Configuration Constants ---
@@ -457,33 +507,36 @@ def _collate_content_to_file(
                 )
             else:  # ProjectMode.SEARCH
                 stats_key = (
-                    "Key: [M: Matched files/dirs]\n"
-                    "     (f=files, d=directories)\n\n"
+                    "Key: [M: Matched files/dirs]\n" "     (f=files, d=directories)\n\n"
                 )
             buffer.write(stats_key)
         tree_content = "\n".join(tree_content_lines)
         buffer.write(tree_content + "\n")
         buffer.write(f"\n{separator_line}\n\n")
 
-    for file_info in files_to_process:
-        header_content = f"{separator_line}\n{FILE_HEADER_PREFIX}{file_info.relative_path_posix}\n{separator_line}\n\n"
-        buffer.write(header_content)
-        try:
-            with open(
-                file_info.absolute_path, "r", encoding=encoding, errors="replace"
-            ) as infile:
-                file_content = infile.read()
-                buffer.write(file_content)
-            buffer.write("\n\n")
-        except Exception:
-            buffer.write(
-                f"Error: Could not read file '{file_info.relative_path_posix}'.\n\n"
-            )
-
-    if not files_to_process and not tree_content_lines:
-        buffer.write(
-            "No files found matching the specified criteria for content aggregation.\n"
+    # This message is for the file content, not the console.
+    if not files_to_process:
+        message = (
+            "No files found matching the specified criteria.\n"
+            if mode == ProjectMode.SEARCH
+            else "No files found matching the specified criteria for content aggregation.\n"
         )
+        buffer.write(message)
+    else:
+        for file_info in files_to_process:
+            header_content = f"{separator_line}\n{FILE_HEADER_PREFIX}{file_info.relative_path_posix}\n{separator_line}\n\n"
+            buffer.write(header_content)
+            try:
+                with open(
+                    file_info.absolute_path, "r", encoding=encoding, errors="replace"
+                ) as infile:
+                    file_content = infile.read()
+                    buffer.write(file_content)
+                buffer.write("\n\n")
+            except Exception:
+                buffer.write(
+                    f"Error: Could not read file '{file_info.relative_path_posix}'.\n\n"
+                )
 
     # Get the complete content from the buffer
     final_content = buffer.getvalue()
@@ -506,17 +559,22 @@ def _collate_content_to_file(
             # Write the main content
             outfile.write(final_content)
     except IOError as e:
-        print(f"Error: Could not write to output file '{output_file_path}': {e}")
+        print(f"\nError: Could not write to output file '{output_file_path}': {e}")
         return
 
-    # Final console output remains for user feedback
-    print(f"\nProcess complete. Output written to: {output_file_path}")
+    # Final console output for user feedback
+    if mode == ProjectMode.SEARCH:
+        if files_to_process:
+            print("\nSuccess! Collation complete.")
+    else:  # Filter mode has its own messaging pattern
+        print(f"\nProcess complete. Output written to: {output_file_path}")
+        if len(files_to_process) > 0:
+            print(
+                f"Summary: {len(files_to_process)} files selected for content processing."
+            )
+
     if show_token_count:
         print(f"Total Approximated Tokens ({mode_display}): {total_token_count}")
-    if len(files_to_process) > 0:
-        print(
-            f"Summary: {len(files_to_process)} files selected for content processing."
-        )
 
 
 def filter_and_append_content(
@@ -611,19 +669,43 @@ def search_and_collate_content(
     if not normalized_keywords:
         print("Error: Search mode requires 'search_keywords' to be provided.")
         return
+
+    print("Phase 1: Finding all matching files...")
+    if criteria.ignore_path_components:
+        print(
+            f"Ignoring directories and files containing: {', '.join(criteria.ignore_path_components)}"
+        )
+
     candidate_files: List[Path] = []
     for dirpath_str, dirnames, filenames in os.walk(str(root_dir), topdown=True):
         current_dir_path = Path(dirpath_str)
+        # Prune directories based on ignore criteria
         dirnames[:] = [
-            d for d in dirnames if d.lower() not in criteria.ignore_path_components
+            d
+            for d in dirnames
+            if (current_dir_path / d).name.lower()
+            not in criteria.ignore_path_components
         ]
+
         for filename in filenames:
             file_abs_path = current_dir_path / filename
+            # Also ignore individual files based on path components
+            try:
+                relative_parts = file_abs_path.relative_to(root_dir).parts
+                if any(
+                    part.lower() in criteria.ignore_path_components
+                    for part in relative_parts
+                ):
+                    continue
+            except ValueError:
+                continue
+
             if (
-                file_abs_path.suffix.lower() in criteria.file_extensions
-                or not criteria.file_extensions
+                not criteria.file_extensions
+                or file_abs_path.suffix.lower() in criteria.file_extensions
             ):
                 candidate_files.append(file_abs_path)
+
     matched_files: Set[Path] = set()
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_file = {
@@ -646,23 +728,21 @@ def search_and_collate_content(
             result = future.result()
             if result:
                 matched_files.add(result)
+
     if not matched_files:
         print("\nScan complete. No matching files were found.")
-        _collate_content_to_file(
-            output_file,
-            None,
-            [],
-            DEFAULT_ENCODING,
-            DEFAULT_SEPARATOR_CHAR,
-            DEFAULT_SEPARATOR_LINE_LENGTH,
-            show_token_count,
-            show_tree_stats,
-            ProjectMode.SEARCH,
-        )
+        # Still create the output file with a "not found" message
+        with open(output_file, "w", encoding=DEFAULT_ENCODING) as f_out:
+            f_out.write("No files found matching the specified criteria.\n")
         return
+
     sorted_matched_files = sorted(
         list(matched_files), key=lambda p: p.relative_to(root_dir).as_posix().lower()
     )
+
+    print(f"\nPhase 1 Complete: Found {len(sorted_matched_files)} matching files.")
+    print(f"\nPhase 2: Generating output file at '{Path(output_file).resolve()}'...")
+
     tree_content_lines = _generate_tree_from_paths(
         root_dir, sorted_matched_files, tree_style, show_tree_stats
     )
