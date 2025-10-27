@@ -4,22 +4,30 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dirshot"
-version = "0.1.1"
+version = "0.2.0"
 authors = [
   { name="init-helpful", email="init.helpful@gmail.com" },
 ]
-description = "A flexible utility for creating project snapshots and searching for files."
+description = "A flexible, high-performance utility for creating project snapshots and searching files with a rich terminal UI."
 readme = "README.md"
 requires-python = ">=3.7"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
+    "Topic :: Terminals",
+    "Topic :: Utilities",
 ]
-dependencies = [
-    "tqdm",
-]
+
+
+dependencies = []
 
 [project.urls]
 "Homepage" = "https://github.com/init-helpful/dirshot"
 "Bug Tracker" = "https://github.com/init-helpful/dirshot/issues"
+
+# Install with: pip install dirshot[rich]
+[project.optional-dependencies]
+rich = [
+    "rich>=13.0.0",
+]

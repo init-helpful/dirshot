@@ -1,21 +1,22 @@
+
+"""
+dirshot - A flexible, high-performance utility for creating project snapshots 
+and searching files with a rich terminal UI.
+"""
+
 from .dirshot import (
-    process_project,
-    filter_project,
-    find_in_project,
-    deconstruct_snapshot,
-    ProjectMode,
+    generate_snapshot,
     LanguagePreset,
     IgnorePreset,
-    TreeStylePreset,
 )
 
 __all__ = [
-    "process_project",
-    "filter_project",
-    "find_in_project",
-    "deconstruct_snapshot",
-    "ProjectMode",
+    # The primary function for all scanning and snapshot operations.
+    "generate_snapshot",
+    
+    # Enums for easy configuration of scanning criteria.
     "LanguagePreset",
     "IgnorePreset",
-    "TreeStylePreset",
 ]
+
+__version__ = "0.2.0"

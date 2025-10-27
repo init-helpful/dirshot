@@ -1,1011 +1,1022 @@
 import os
 import sys
 import re
-import time  # Imported for the fallback progress bar
+import time
+import threading
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import List, Optional, Set, Tuple, Callable, NamedTuple, Dict, Any
+from typing import List, Optional, Set, Tuple, NamedTuple, Dict, Any
 from enum import Enum
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
+from contextlib import contextmanager
 
-# --- TQDM Dependency Handler ---
+# --- Dependency & Console Management ---
 try:
-    from tqdm import tqdm
+    from rich.console import Console
+    from rich.progress import (
+        Progress,
+        SpinnerColumn,
+        BarColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+    from rich.table import Table
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.text import Text
+
+    RICH_AVAILABLE = True
 except ImportError:
+    RICH_AVAILABLE = False
 
-    # Define a functional fallback dummy tqdm class if the import fails.
-    class tqdm:
-        """A simple, text-based progress bar fallback if tqdm is not installed."""
+    class FallbackProgress:
+        """A simple, dependency-free progress handler for when 'rich' is not installed."""
 
-        def __init__(self, iterable=None, total=None, desc="", unit="it", **kwargs):
-            self.iterable = iterable
-            self.total = (
-                total
-                if total is not None
-                else (len(iterable) if hasattr(iterable, "__len__") else None)
+        def __init__(self):
+            self.tasks, self.task_count, self.active_line = {}, 0, ""
+
+        def add_task(self, description, total=None, **kwargs):
+            task_id = self.task_count
+            self.tasks[task_id] = {"d": description, "t": total, "c": 0}
+            self.task_count += 1
+            return task_id
+
+        def update(
+            self, task_id, advance=0, completed=None, description=None, **kwargs
+        ):
+            if task_id not in self.tasks:
+                return
+            task = self.tasks[task_id]
+            if description:
+                task["d"] = description
+            task["c"] = completed if completed is not None else task["c"] + advance
+            line = f"-> {task['d']}: {task['c']}" + (
+                f"/{task['t']}" if task["t"] else ""
             )
-            self.desc = desc
-            self.unit = unit
-            self.current = 0
-            self.start_time = time.time()
-            self._last_update_time = 0
-
-        def __iter__(self):
-            for obj in self.iterable:
-                yield obj
-                self.update(1)
-            # The loop is finished, ensure the bar is 100% and close
-            if self.total is not None and self.current < self.total:
-                self.update(self.total - self.current)
-            self.close()
-
-        def update(self, n=1):
-            """Update the progress bar by n steps."""
-            self.current += n
-            now = time.time()
-            # Throttle screen updates to prevent flickering and performance loss
-            if (
-                self.total is None
-                or now - self._last_update_time > 0.1
-                or self.current == self.total
-            ):
-                self._last_update_time = now
-                self._draw()
-
-        def set_description(self, desc: str):
-            """Set the description of the progress bar."""
-            self.desc = desc
-            self._draw()
-
-        def _draw(self):
-            """Draw the progress bar to the console."""
-            if self.total:
-                percent = int((self.current / self.total) * 100)
-                bar_length = 25
-                filled_length = int(bar_length * self.current // self.total)
-                bar = "█" * filled_length + "-" * (bar_length - filled_length)
-                # Use carriage return to print on the same line
-                progress_line = f"\r{self.desc}: {percent}%|{bar}| {self.current}/{self.total} [{self.unit}]"
-                sys.stdout.write(progress_line)
-            else:  # Case where total is not known
-                sys.stdout.write(f"\r{self.desc}: {self.current} {self.unit}")
-
+            sys.stdout.write("\r" + line.ljust(len(self.active_line) + 2))
             sys.stdout.flush()
+            self.active_line = line
 
-        def close(self):
-            """Clean up the progress bar line."""
-            # Print a newline to move off the progress bar line
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
             sys.stdout.write("\n")
             sys.stdout.flush()
 
 
+class ConsoleManager:
+    """A wrapper to gracefully handle console output with or without 'rich'."""
+
+    def __init__(self):
+        """Initializes the ConsoleManager, detecting if 'rich' is available."""
+        self.console = Console() if RICH_AVAILABLE else None
+
+    def log(self, message: str, style: str = ""):
+        """Logs a message to the console, applying a style if 'rich' is available."""
+        if self.console:
+            self.console.log(message, style=style)
+        else:
+            print(f"[{time.strftime('%H:%M:%S')}] {message}")
+
+    def print_table(self, title: str, columns: List[str], rows: List[List[str]]):
+        """Prints a formatted table to the console."""
+        if self.console:
+            table = Table(
+                title=title,
+                show_header=True,
+                header_style="bold magenta",
+                border_style="dim",
+            )
+            for col in columns:
+                table.add_column(col)
+            for row in rows:
+                table.add_row(*row)
+            self.console.print(table)
+        else:
+            print(f"\n--- {title} ---")
+            print(" | ".join(columns))
+            for row in rows:
+                print(" | ".join(row))
+            print("-" * (len(title) + 6))
+
+
 # --- Configuration Constants ---
-DEFAULT_SEPARATOR_CHAR = "-"
-DEFAULT_SEPARATOR_LINE_LENGTH = 80
-DEFAULT_ENCODING = "utf-8"
-TREE_HEADER_TEXT = "Project File Structure"
-FILE_HEADER_PREFIX = "FILE: "
-TOKEN_APPROX_MODE = "CHAR_COUNT"
+DEFAULT_SEPARATOR_CHAR, DEFAULT_ENCODING = "-", "utf-8"
+TREE_HEADER_TEXT, FILE_HEADER_PREFIX = "Project File Structure", "FILE: "
+BINARY_FILE_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".pdf",
+    ".zip",
+    ".exe",
+    ".dll",
+    ".so",
+    ".jar",
+    ".pyc",
+    ".mp3",
+    ".mp4",
+}
 
-# --- Public Enums for Import and Usage ---
+
+# --- Base Lists for Presets ---
+# These are defined outside the enums to allow for safe composition.
+_PYTHON_BASE = [
+    ".py",
+    ".pyw",
+    "requirements.txt",
+    "Pipfile",
+    "pyproject.toml",
+    "setup.py",
+]
+_JAVASCRIPT_BASE = [
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".mjs",
+    ".cjs",
+    "package.json",
+    "jsconfig.json",
+    "tsconfig.json",
+]
+_RUBY_BASE = [".rb", "Gemfile", "Rakefile", ".gemspec"]
+_PHP_BASE = [".php", "composer.json", "index.php"]
+_JAVA_BASE = [".java", ".jar", ".war", "pom.xml", ".properties"]
+_KOTLIN_BASE = [".kt", ".kts", ".gradle", "build.gradle.kts"]
+_CSHARP_BASE = [".cs", ".csproj", ".sln", "appsettings.json", "Web.config", ".csx"]
+_C_CPP_BASE = [".c", ".cpp", ".h", ".hpp", "Makefile", "CMakeLists.txt", ".cxx", ".hxx"]
+_RUST_BASE = [".rs", "Cargo.toml", "Cargo.lock"]
+_SWIFT_BASE = [".swift", "Package.swift"]
+_OBJECTIVE_C_BASE = [".m", ".mm", ".h"]
+_ELIXIR_BASE = [".ex", ".exs", "mix.exs"]
+_DART_BASE = [".dart", "pubspec.yaml"]
+_SCALA_BASE = [".scala", ".sbt", "build.sbt"]
+_R_LANG_BASE = [".r", ".R", ".Rmd"]
+_LUA_BASE = [".lua"]
+
+_IDE_VSCODE = [".vscode"]
+_IDE_JETBRAINS = [".idea"]
+_IDE_SUBLIME = ["*.sublime-project", "*.sublime-workspace"]
+_IDE_ECLIPSE = [".project", ".settings", ".classpath"]
+_IDE_NETBEANS = ["nbproject"]
+_IDE_ATOM = [".atom"]
+_IDE_VIM = ["*.swp", "*.swo"]
+_IDE_XCODE = ["*.xcodeproj", "*.xcworkspace", "xcuserdata"]
 
 
-class ProjectMode(Enum):
-    """The mode of operation for the script."""
-
-    FILTER = "filter"
-    SEARCH = "search"
-
-
+# --- Enums and Data Structures ---
 class LanguagePreset(Enum):
-    """Predefined sets of file extensions/names for common languages/frameworks."""
+    """Provides an extensive list of presets for common language file extensions and key project files."""
 
-    PYTHON = [
-        ".py",
-        ".pyw",
-        "setup.py",
-        "requirements.txt",
-        "Pipfile",
-        "pyproject.toml",
+    PYTHON = _PYTHON_BASE
+    JAVASCRIPT = _JAVASCRIPT_BASE
+    JAVA = _JAVA_BASE
+    KOTLIN = _KOTLIN_BASE
+    C_CPP = _C_CPP_BASE
+    C_SHARP = _CSHARP_BASE
+    GO = [".go", "go.mod", "go.sum"]
+    RUST = _RUST_BASE
+    RUBY = _RUBY_BASE
+    PHP = _PHP_BASE
+    SWIFT = _SWIFT_BASE
+    OBJECTIVE_C = _OBJECTIVE_C_BASE
+    DART = _DART_BASE
+    LUA = _LUA_BASE
+    PERL = [".pl", ".pm", ".t"]
+    R_LANG = _R_LANG_BASE
+    SCALA = _SCALA_BASE
+    GROOVY = [".groovy", ".gvy", ".gy", ".gsh"]
+    HASKELL = [".hs", ".lhs", "cabal.project"]
+    JULIA = [".jl"]
+    ZIG = [".zig", "build.zig"]
+    NIM = [".nim", ".nimble"]
+    ELIXIR = _ELIXIR_BASE
+    CLOJURE = [".clj", ".cljs", ".cljc", "project.clj", "deps.edn"]
+    F_SHARP = [".fs", ".fsi", ".fsx"]
+    OCAML = [".ml", ".mli", "dune-project"]
+    ELM = [".elm", "elm.json"]
+    PURE_SCRIPT = [".purs", "spago.dhall"]
+    COMMON_LISP = [".lisp", ".cl", ".asd"]
+    SCHEME = [".scm", ".ss"]
+    RACKET = [".rkt"]
+    WEB_FRONTEND = [".html", ".htm", ".css", ".scss", ".sass", ".less", ".styl"]
+    REACT = _JAVASCRIPT_BASE
+    NODE_JS = _JAVASCRIPT_BASE
+    EXPRESS_JS = _JAVASCRIPT_BASE
+    NEST_JS = _JAVASCRIPT_BASE + ["nest-cli.json"]
+    VUE = _JAVASCRIPT_BASE + [".vue", "vue.config.js"]
+    ANGULAR = _JAVASCRIPT_BASE + ["angular.json"]
+    SVELTE = _JAVASCRIPT_BASE + [".svelte", "svelte.config.js"]
+    EMBER = _JAVASCRIPT_BASE + ["ember-cli-build.js"]
+    PUG = [".pug", ".jade"]
+    HANDLEBARS = [".hbs", ".handlebars"]
+    EJS = [".ejs"]
+    DJANGO = _PYTHON_BASE + ["manage.py", "wsgi.py", "asgi.py", ".jinja", ".jinja2"]
+    FLASK = _PYTHON_BASE + ["app.py", "wsgi.py"]
+    RAILS = _RUBY_BASE + ["routes.rb", ".erb", ".haml", ".slim", "config.ru"]
+    LARAVEL = _PHP_BASE + [".blade.php", "artisan"]
+    SYMFONY = _PHP_BASE + ["symfony.lock"]
+    PHOENIX = _ELIXIR_BASE
+    SPRING = _JAVA_BASE + ["application.properties", "application.yml"]
+    ASP_NET = _CSHARP_BASE + ["*.cshtml", "*.vbhtml", "*.razor"]
+    ROCKET_RS = _RUST_BASE + ["Rocket.toml"]
+    ACTIX_WEB = _RUST_BASE
+    IOS_NATIVE = (
+        _SWIFT_BASE
+        + _OBJECTIVE_C_BASE
+        + [".storyboard", ".xib", "Info.plist", ".pbxproj"]
+    )
+    ANDROID_NATIVE = _JAVA_BASE + _KOTLIN_BASE + ["AndroidManifest.xml", ".xml"]
+    FLUTTER = _DART_BASE
+    REACT_NATIVE = _JAVASCRIPT_BASE + ["app.json"]
+    XAMARIN = _CSHARP_BASE + [".xaml"]
+    DOTNET_MAUI = XAMARIN
+    NATIVESCRIPT = _JAVASCRIPT_BASE + ["nativescript.config.ts"]
+    UNITY = _CSHARP_BASE + [".unity", ".prefab", ".asset", ".mat", ".unitypackage"]
+    UNREAL_ENGINE = _C_CPP_BASE + [".uproject", ".uasset", ".ini"]
+    GODOT = [".gd", ".tscn", ".tres", "project.godot"]
+    LOVE2D = _LUA_BASE + ["conf.lua", "main.lua"]
+    MONOGAME = _CSHARP_BASE + [".mgcb"]
+    DOCKER = ["Dockerfile", ".dockerignore", "docker-compose.yml"]
+    TERRAFORM = [".tf", ".tfvars", ".tf.json"]
+    ANSIBLE = ["ansible.cfg", "inventory.ini"]
+    PULUMI = ["Pulumi.yaml"]
+    CHEF = _RUBY_BASE
+    PUPPET = [".pp"]
+    VAGRANT = ["Vagrantfile"]
+    GITHUB_ACTIONS = [".yml", ".yaml"]
+    GITLAB_CI = [".gitlab-ci.yml"]
+    JENKINS = ["Jenkinsfile"]
+    CIRCLE_CI = ["config.yml"]
+    KUBERNETES = [".yml", ".yaml"]
+    BICEP = [".bicep"]
+    CLOUDFORMATION = [".json", ".yml"]
+    DATA_SCIENCE_NOTEBOOKS = [".ipynb", ".Rmd"]
+    SQL = [".sql", ".ddl", ".dml"]
+    APACHE_SPARK = list(set(_SCALA_BASE + _PYTHON_BASE + _JAVA_BASE + _R_LANG_BASE))
+    ML_CONFIG = ["params.yaml"]
+    ELECTRON = _JAVASCRIPT_BASE
+    TAURI = _RUST_BASE + ["tauri.conf.json"]
+    QT = _C_CPP_BASE + [".pro", ".ui", ".qml"]
+    GTK = _C_CPP_BASE + [".ui", "meson.build"]
+    WPF = _CSHARP_BASE + [".xaml"]
+    WINDOWS_FORMS = _CSHARP_BASE
+    BASH = [".sh", ".bash"]
+    POWERSHELL = [".ps1", ".psm1"]
+    BATCH = [".bat", ".cmd"]
+    SOLIDITY = [".sol"]
+    VYPER = [".vy"]
+    VERILOG = [".v", ".vh"]
+    VHDL = [".vhd", ".vhdl"]
+    MARKUP = [".md", ".markdown", ".rst", ".adoc", ".asciidoc", ".tex", ".bib"]
+    CONFIGURATION = [
+        ".json",
+        ".xml",
+        ".yml",
+        ".yaml",
+        ".ini",
+        ".toml",
+        ".env",
+        ".conf",
+        ".cfg",
     ]
-    JAVASCRIPT = [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"]
-    WEB = [".html", ".css", ".scss", ".less"]
-    JAVA = [".java", ".groovy", ".kt", ".gradle", ".properties"]
+    EDITOR_CONFIG = [".editorconfig"]
+    LICENSE = ["LICENSE", "LICENSE.md", "COPYING"]
+    CHANGELOG = ["CHANGELOG", "CHANGELOG.md"]
 
 
 class IgnorePreset(Enum):
-    """Predefined sets of path components and filename substrings to ignore."""
+    """Provides an extensive list of presets for common directories, files, and patterns to ignore."""
 
-    VERSION_CONTROL = [".git", ".svn", ".hg", ".idea"]
-    NODE_MODULES = ["node_modules", "package-lock.json", "yarn.lock"]
-    PYTHON_ENV = ["__pycache__", "venv", ".venv", "env", "lib", "bin"]
-    BUILD_ARTIFACTS = ["dist", "build", "target", "out", "temp", "tmp"]
-    TEST_FILES = ["test", "spec", "fixture", "example", "mock"]
-
-
-class TreeStylePreset(Enum):
-    """Predefined character sets for directory tree rendering."""
-
-    UNICODE = ("├── ", "└── ", "│   ", "    ")
-    ASCII = ("|-- ", "+-- ", "|   ", "    ")
-    COMPACT = ("|---", "`---", "|   ", "    ")
-
-    def to_style(self) -> "TreeStyle":
-        return TreeStyle(self.value[0], self.value[1], self.value[2], self.value[3])
-
-
-class TreeStyle(NamedTuple):
-    """Holds the characters used to render the directory tree."""
-
-    t_connector: str
-    l_connector: str
-    v_connector: str
-    h_spacer: str
-
-
-# --- Helper Data Structures ---
-
-
-@dataclass
-class FilterCriteria:
-    """Holds normalized filter criteria for files and directories."""
-
-    file_extensions: Set[str] = field(default_factory=set)
-    exact_filenames: Set[str] = field(default_factory=set)
-    whitelist_fname_substrings: Set[str] = field(default_factory=set)
-    ignore_fname_substrings: Set[str] = field(default_factory=set)
-    ignore_path_components: Set[str] = field(default_factory=set)
-
-    @classmethod
-    def normalize_inputs(
-        cls,
-        file_types: Optional[List[str]],
-        whitelist_substrings: Optional[List[str]],
-        ignore_filename_substrings: Optional[List[str]],
-        ignore_path_components_list: Optional[List[str]],
-        language_presets: Optional[List[LanguagePreset]] = None,
-        ignore_presets: Optional[List[IgnorePreset]] = None,
-    ) -> "FilterCriteria":
-        all_file_types, all_ignore_paths, all_ignore_fnames = (
-            set(file_types or []),
-            set(ignore_path_components_list or []),
-            set(ignore_filename_substrings or []),
+    VERSION_CONTROL = [".git", ".svn", ".hg", ".bzr", ".gitignore", ".gitattributes"]
+    OS_FILES = [".DS_Store", "Thumbs.db", "desktop.ini", "ehthumbs.db"]
+    BUILD_ARTIFACTS = [
+        "dist",
+        "build",
+        "target",
+        "out",
+        "bin",
+        "obj",
+        "release",
+        "debug",
+    ]
+    LOGS = ["*.log", "logs", "npm-debug.log*", "yarn-debug.log*", "yarn-error.log*"]
+    TEMP_FILES = ["temp", "tmp", "*.tmp", "*~", "*.bak", "*.swp", "*.swo"]
+    SECRET_FILES = [
+        ".env",
+        "*.pem",
+        "*.key",
+        "credentials.json",
+        "*.p12",
+        "*.pfx",
+        "secrets.yml",
+        ".env.local",
+    ]
+    COMPRESSED_ARCHIVES = ["*.zip", "*.tar", "*.gz", "*.rar", "*.7z", "*.tgz"]
+    IDE_METADATA_VSCODE = _IDE_VSCODE
+    IDE_METADATA_JETBRAINS = _IDE_JETBRAINS
+    IDE_METADATA_SUBLIME = _IDE_SUBLIME
+    IDE_METADATA_ECLIPSE = _IDE_ECLIPSE
+    IDE_METADATA_NETBEANS = _IDE_NETBEANS
+    IDE_METADATA_ATOM = _IDE_ATOM
+    IDE_METADATA_VIM = _IDE_VIM
+    IDE_METADATA_XCODE = _IDE_XCODE
+    IDE_METADATA = list(
+        set(
+            _IDE_VSCODE
+            + _IDE_JETBRAINS
+            + _IDE_SUBLIME
+            + _IDE_ECLIPSE
+            + _IDE_NETBEANS
+            + _IDE_ATOM
+            + _IDE_VIM
+            + _IDE_XCODE
         )
-        if language_presets:
-            for preset in language_presets:
-                all_file_types.update(preset.value)
-        if ignore_presets:
-            for preset in ignore_presets:
-                all_ignore_paths.update(preset.value)
-                all_ignore_fnames.update(preset.value)
-        norm_exts, norm_exact_fnames = set(), set()
-        for ft in all_file_types:
-            ft_lower = ft.lower().strip()
-            if ft_lower.startswith("."):
-                norm_exts.add(ft_lower)
-            elif ft_lower:
-                norm_exact_fnames.add(ft_lower)
-        return cls(
-            file_extensions=norm_exts,
-            exact_filenames=norm_exact_fnames,
-            whitelist_fname_substrings=(
-                set(s.lower() for s in whitelist_substrings if s.strip())
-                if whitelist_substrings
-                else set()
-            ),
-            ignore_fname_substrings=set(
-                s.lower() for s in all_ignore_fnames if s.strip()
-            ),
-            ignore_path_components=set(
-                d.lower() for d in all_ignore_paths if d.strip()
-            ),
-        )
+    )
+    NODE_JS = [
+        "node_modules",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        ".npm",
+    ]
+    PYTHON = [
+        "__pycache__",
+        "venv",
+        ".venv",
+        "env",
+        "lib",
+        "lib64",
+        ".pytest_cache",
+        ".tox",
+        "*.pyc",
+        ".mypy_cache",
+        "htmlcov",
+        ".coverage",
+    ]
+    RUBY = ["vendor/bundle", ".bundle", "Gemfile.lock", ".gem", "coverage"]
+    PHP = ["vendor", "composer.lock"]
+    DOTNET = ["bin", "obj", "*.user", "*.suo"]
+    RUST = ["target", "Cargo.lock"]
+    GO = ["vendor", "go.sum"]
+    JAVA_MAVEN = ["target"]
+    JAVA_GRADLE = [".gradle", "build"]
+    ELIXIR = ["_build", "deps", "mix.lock"]
+    DART_FLUTTER = [".dart_tool", ".packages", "build", ".flutter-plugins"]
+    ELM = ["elm-stuff"]
+    HASKELL = ["dist-newstyle", ".stack-work"]
+    TESTING_REPORTS = ["coverage", "junit.xml", "lcov.info", ".nyc_output"]
+    STATIC_SITE_GENERATORS = ["_site", "public", "resources"]
+    CMS_UPLOADS = ["wp-content/uploads"]
+    TERRAFORM = [".terraform", "*.tfstate", "*.tfstate.backup", ".terraform.lock.hcl"]
+    JUPYTER_NOTEBOOKS = [".ipynb_checkpoints"]
+    ANDROID = [".gradle", "build", "local.properties", "*.apk", "*.aab", "captures"]
+    IOS = ["Pods", "Carthage", "DerivedData", "build"]
+    UNITY = [
+        "Library",
+        "Temp",
+        "Logs",
+        "UserSettings",
+        "MemoryCaptures",
+        "Assets/AssetStoreTools",
+    ]
+    UNREAL_ENGINE = ["Intermediate", "Saved", "DerivedDataCache", ".vs"]
+    GODOT_ENGINE = [".import", "export_presets.cfg"]
+    SERVERLESS_FRAMEWORK = [".serverless"]
+    AWS = [".aws-sam"]
+    VERCEL = [".vercel"]
+    NETLIFY = [".netlify"]
+    MACOS = [
+        ".DS_Store",
+        ".AppleDouble",
+        ".LSOverride",
+        "._*",
+        ".Spotlight-V100",
+        ".Trashes",
+    ]
+    WINDOWS = ["Thumbs.db", "ehthumbs.db", "$RECYCLE.BIN/", "Desktop.ini"]
+    DEPRECATED_DEPENDENCIES = ["bower_components"]
 
 
 class FileToProcess(NamedTuple):
-    """Represents a file selected for content processing."""
+    """Represents a file that needs to be processed and included in the output."""
 
     absolute_path: Path
     relative_path_posix: str
 
 
-# --- Helper Functions ---
+@dataclass
+class FilterCriteria:
+    """Holds the combined filter criteria for scanning files and directories."""
 
+    file_extensions: Set[str] = field(default_factory=set)
+    ignore_if_in_path: Set[str] = field(default_factory=set)
+    ignore_extensions: Set[str] = field(default_factory=set)
 
-def validate_root_directory(root_dir_param: Optional[str]) -> Optional[Path]:
-    original_param_for_messaging = (
-        root_dir_param if root_dir_param else "current working directory"
-    )
-    try:
-        resolved_path = Path(root_dir_param or Path.cwd()).resolve(strict=True)
-    except Exception as e:
-        print(
-            f"Error: Could not resolve root directory '{original_param_for_messaging}': {e}"
+    @classmethod
+    def normalize_inputs(
+        cls,
+        file_types: Optional[List[str]] = None,
+        ignore_if_in_path: Optional[List[str]] = None,
+        ignore_extensions: Optional[List[str]] = None,
+        lang_presets: Optional[List[LanguagePreset]] = None,
+        ignore_presets: Optional[List[IgnorePreset]] = None,
+    ) -> "FilterCriteria":
+        """
+        Consolidates various filter inputs into a single FilterCriteria object.
+
+        Args:
+            file_types (list, optional): A list of file extensions to include.
+            ignore_if_in_path (list, optional): A list of directory/file names to ignore.
+            ignore_extensions (list, optional): A list of file extensions to ignore.
+            lang_presets (list, optional): A list of LanguagePreset enums.
+            ignore_presets (list, optional): A list of IgnorePreset enums.
+
+        Returns:
+            FilterCriteria: An object containing the combined sets of filters.
+        """
+        all_exts = {ft.lower().strip() for ft in file_types or []}
+        all_ignore_paths = {ip.lower().strip() for ip in ignore_if_in_path or []}
+        all_ignore_exts = {ie.lower().strip() for ie in ignore_extensions or []}
+
+        for p in lang_presets or []:
+            all_exts.update(p.value)
+        for p in ignore_presets or []:
+            all_ignore_paths.update(p.value)
+
+        return cls(
+            file_extensions=all_exts,
+            ignore_if_in_path=all_ignore_paths,
+            ignore_extensions=all_ignore_exts,
         )
-        return None
-    if not resolved_path.is_dir():
-        print(f"Error: Root path '{resolved_path}' is not a directory.")
-        return None
-    return resolved_path
 
 
-def _should_include_entry(
-    entry_path: Path,
-    root_dir: Path,
-    criteria: FilterCriteria,
-    is_dir: bool,
-    log_func: Optional[Callable[[str], None]] = None,
-) -> bool:
-    try:
-        relative_path = entry_path.relative_to(root_dir)
-    except ValueError:
-        return False
-    entry_name_lower = entry_path.name.lower()
-    if criteria.ignore_path_components and any(
-        part.lower() in criteria.ignore_path_components for part in relative_path.parts
-    ):
-        return False
-    if is_dir:
-        return True
-    file_ext_lower = entry_path.suffix.lower()
-    matched_type = (file_ext_lower in criteria.file_extensions) or (
-        entry_name_lower in criteria.exact_filenames
-    )
-    if not criteria.file_extensions and not criteria.exact_filenames:
-        matched_type = True
-    if not matched_type:
-        return False
-    if criteria.whitelist_fname_substrings and not any(
-        sub in entry_name_lower for sub in criteria.whitelist_fname_substrings
-    ):
-        return False
-    if criteria.ignore_fname_substrings and any(
-        sub in entry_name_lower for sub in criteria.ignore_fname_substrings
-    ):
-        return False
-    return True
+# --- Core Logic Functions ---
+def _discover_files(
+    root_dir: Path, criteria: FilterCriteria, progress: Any, task_id: Any
+) -> List[Path]:
+    """
+    Recursively scans a directory to find all files matching the criteria.
+
+    Args:
+        root_dir (Path): The directory to start the scan from.
+        criteria (FilterCriteria): The filtering criteria to apply.
+        progress (Any): The progress bar object (from rich or fallback).
+        task_id (Any): The ID of the progress bar task to update.
+
+    Returns:
+        List[Path]: A list of absolute paths to the candidate files.
+    """
+    candidate_files, dirs_scanned = [], 0
+
+    def recursive_scan(current_path: Path):
+        nonlocal dirs_scanned
+        try:
+            for entry in os.scandir(current_path):
+                entry_path, entry_lower = Path(entry.path), entry.name.lower()
+                if entry_lower in criteria.ignore_if_in_path:
+                    continue
+                if entry.is_dir():
+                    recursive_scan(entry_path)
+                    dirs_scanned += 1
+                    if progress:
+                        progress.update(
+                            task_id,
+                            completed=dirs_scanned,
+                            description=f"Discovering files in [cyan]{entry.name}[/cyan]",
+                        )
+                elif entry.is_file():
+                    file_ext = entry_path.suffix.lower()
+                    if (
+                        criteria.ignore_extensions
+                        and file_ext in criteria.ignore_extensions
+                    ):
+                        continue
+                    if (
+                        not criteria.file_extensions
+                        or file_ext in criteria.file_extensions
+                    ):
+                        candidate_files.append(entry_path)
+        except (PermissionError, FileNotFoundError):
+            pass
+
+    recursive_scan(root_dir)
+    return candidate_files
 
 
 def process_file_for_search(
     file_path: Path,
-    normalized_keywords: List[str],
-    search_file_contents: bool,
-    full_path_compare: bool,
+    keywords: List[str],
+    search_content: bool,
+    full_path: bool,
+    activity: Dict,
+    read_binary_files: bool,
 ) -> Optional[Path]:
-    compare_target = str(file_path) if full_path_compare else file_path.name
-    if any(key in compare_target.lower() for key in normalized_keywords):
-        return file_path
-    if search_file_contents:
-        try:
-            with open(str(file_path), "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    if any(key in line.lower() for key in normalized_keywords):
-                        return file_path
-        except (IOError, OSError):
-            pass
-    return None
-
-
-def _calculate_total_stats(
-    root_dir: Path, criteria: FilterCriteria
-) -> Dict[Path, Tuple[int, int]]:
-    stats: Dict[Path, Tuple[int, int]] = {}
-    for dirpath_str, dirnames, filenames in os.walk(str(root_dir), topdown=True):
-        current_dir = Path(dirpath_str)
-        all_children = [current_dir / d for d in dirnames] + [
-            current_dir / f for f in filenames
-        ]
-        total_files, total_dirs = 0, 0
-        for child_path in all_children:
-            try:
-                is_dir = child_path.is_dir()
-            except OSError:
-                continue
-            if criteria.ignore_path_components:
-                try:
-                    relative_path = child_path.relative_to(root_dir)
-                except ValueError:
-                    continue
-                if any(
-                    part.lower() in criteria.ignore_path_components
-                    for part in relative_path.parts
-                ):
-                    continue
-            if is_dir:
-                total_dirs += 1
-            else:
-                total_files += 1
-        stats[current_dir] = (total_files, total_dirs)
-        dirnames[:] = [
-            d
-            for d in dirnames
-            if (current_dir / d).name.lower() not in criteria.ignore_path_components
-        ]
-    return stats
-
-
-# --- Tree Generation Functions ---
-
-
-def _generate_tree_lines(
-    root_dir: Path, criteria: FilterCriteria, style: TreeStyle, show_stats: bool
-) -> List[str]:
-    """Generates a list of strings representing the directory tree based on criteria, style, and stats."""
-    dir_stats: Optional[Dict[Path, Tuple[int, int]]] = (
-        _calculate_total_stats(root_dir, criteria) if show_stats else None
-    )
-    tree_lines: List[str] = []
-
-    def format_dir_name(
-        path: Path, path_name: str, included_files: int, included_dirs: int
-    ) -> str:
-        if not show_stats or not dir_stats:
-            return path_name
-        total_files, total_dirs = dir_stats.get(path, (0, 0))
-
-        stats_str = f" [I: {included_files}f, {included_dirs}d | T: {total_files}f, {total_dirs}d]"
-        return path_name + stats_str
-
-    def _recursive_build(current_path: Path, prefix_parts: List[str]):
-        try:
-            entries = sorted(current_path.iterdir(), key=lambda p: p.name.lower())
-        except OSError as e:
-            error_prefix = "".join(prefix_parts) + style.l_connector
-            tree_lines.append(
-                error_prefix + f"[Error accessing: {current_path.name} - {e.strerror}]"
-            )
-            return
-        displayable_children: List[Tuple[Path, bool]] = []
-        for e in entries:
-            try:
-                is_dir = e.is_dir()
-            except OSError:
-                continue
-            if _should_include_entry(
-                e, root_dir, criteria, is_dir=is_dir, log_func=None
-            ):
-                displayable_children.append((e, is_dir))
-        num_children = len(displayable_children)
-        included_files_in_level = sum(
-            1 for _, is_dir in displayable_children if not is_dir
-        )
-        included_dirs_in_level = sum(1 for _, is_dir in displayable_children if is_dir)
-        if not prefix_parts:
-            tree_lines.append(
-                format_dir_name(
-                    current_path,
-                    current_path.name,
-                    included_files_in_level,
-                    included_dirs_in_level,
-                )
-            )
-        for i, (child_path, child_is_dir) in enumerate(displayable_children):
-            is_last = i == num_children - 1
-            connector = style.l_connector if is_last else style.t_connector
-            entry_name = child_path.name
-            if child_is_dir:
-                try:
-                    child_entries = sorted(
-                        child_path.iterdir(), key=lambda p: p.name.lower()
-                    )
-                    child_displayable_children = [
-                        (e, e.is_dir())
-                        for e in child_entries
-                        if _should_include_entry(
-                            e, root_dir, criteria, is_dir=e.is_dir(), log_func=None
-                        )
-                    ]
-                    child_included_files = sum(
-                        1 for _, is_dir in child_displayable_children if not is_dir
-                    )
-                    child_included_dirs = sum(
-                        1 for _, is_dir in child_displayable_children if is_dir
-                    )
-                    entry_name = format_dir_name(
-                        child_path,
-                        child_path.name,
-                        child_included_files,
-                        child_included_dirs,
-                    )
-                except OSError:
-                    pass
-            tree_lines.append("".join(prefix_parts) + connector + entry_name)
-            if child_is_dir:
-                new_prefix_parts = prefix_parts + [
-                    style.h_spacer if is_last else style.v_connector
-                ]
-                _recursive_build(child_path, new_prefix_parts)
-
-    _recursive_build(root_dir, [])
-    return tree_lines
-
-
-def _generate_tree_from_paths(
-    root_dir: Path, file_paths: List[Path], style: TreeStyle, show_stats: bool
-) -> List[str]:
-    """Generates a directory tree structure from a list of *matched* file paths using the given style."""
-    tree_dict: Dict[str, Any] = {}
-    matched_paths = {p.relative_to(root_dir) for p in file_paths}
-    for rel_path in matched_paths:
-        parts = rel_path.parts
-        current_level = tree_dict
-        for part in parts:
-            current_level = current_level.setdefault(part, {})
-    tree_lines: List[str] = []
-
-    def format_dir_name_search(name: str, matched_files: int, matched_dirs: int) -> str:
-        if not show_stats:
-            return name
-
-        stats_str = f" [M: {matched_files}f, {matched_dirs}d]"
-        return name + stats_str
-
-    def build_lines(d: Dict[str, Any], prefix: str):
-        items = sorted(d.keys(), key=lambda k: (len(d[k]) == 0, k.lower()))
-        num_children = len(items)
-        matched_files_in_level = sum(1 for k in items if not d[k])
-        matched_dirs_in_level = sum(1 for k in items if d[k])
-        if not prefix:
-            tree_lines.append(
-                format_dir_name_search(
-                    root_dir.name, matched_files_in_level, matched_dirs_in_level
-                )
-            )
-        for i, name in enumerate(items):
-            is_last = i == num_children - 1
-            connector = style.l_connector if is_last else style.t_connector
-            entry_name = name
-            if d[name]:
-                child_matched_files = sum(1 for k in d[name] if not d[name][k])
-                child_matched_dirs = sum(1 for k in d[name] if d[name][k])
-                entry_name = format_dir_name_search(
-                    name, child_matched_files, child_matched_dirs
-                )
-            tree_lines.append(prefix + connector + entry_name)
-            if d[name]:
-                extension = style.h_spacer if is_last else style.v_connector
-                build_lines(d[name], prefix + extension)
-
-    build_lines(tree_dict, "")
-    return tree_lines
-
-
-# --- Collation and Main Modes ---
-
-
-def _collate_content_to_file(
-    output_file_path_str: str,
-    tree_content_lines: Optional[List[str]],
-    files_to_process: List[FileToProcess],
-    encoding: str,
-    separator_char: str,
-    separator_line_len: int,
-    show_token_count: bool,
-    show_tree_stats: bool,
-    mode: ProjectMode,
-) -> None:
     """
-    Collates content to a string buffer, calculates token count,
-    and then writes to the output file.
+    Processes a single file to see if it matches the search criteria.
+
+    A match can occur if a keyword is found in the filename or, if enabled,
+    within the file's content.
+
+    Args:
+        file_path (Path): The absolute path to the file to process.
+        keywords (List[str]): A list of keywords to search for.
+        search_content (bool): If True, search the content of the file.
+        full_path (bool): If True, compare keywords against the full file path.
+        activity (Dict): A dictionary to track thread activity.
+        read_binary_files (bool): If True, attempt to read and search binary files.
+
+    Returns:
+        Optional[Path]: The path to the file if it's a match, otherwise None.
     """
-    output_file_path = Path(output_file_path_str).resolve()
-    output_file_path.parent.mkdir(parents=True, exist_ok=True)
-    separator_line = separator_char * separator_line_len
-
-    # Use an in-memory buffer to build the output first
-    buffer = StringIO()
-
-    if tree_content_lines:
-        buffer.write(f"{TREE_HEADER_TEXT}\n{separator_line}\n\n")
-        stats_key = ""
-        if show_tree_stats:
-            if mode == ProjectMode.FILTER:
-                stats_key = (
-                    "Key: [I: Included f/d | T: Total f/d in original dir]\n"
-                    "     (f=files, d=directories)\n\n"
-                )
-            else:  # ProjectMode.SEARCH
-                stats_key = (
-                    "Key: [M: Matched files/dirs]\n" "     (f=files, d=directories)\n\n"
-                )
-            buffer.write(stats_key)
-        tree_content = "\n".join(tree_content_lines)
-        buffer.write(tree_content + "\n")
-        buffer.write(f"\n{separator_line}\n\n")
-
-    # This message is for the file content, not the console.
-    if not files_to_process:
-        message = (
-            "No files found matching the specified criteria.\n"
-            if mode == ProjectMode.SEARCH
-            else "No files found matching the specified criteria for content aggregation.\n"
-        )
-        buffer.write(message)
-    else:
-        for file_info in files_to_process:
-            header_content = f"{separator_line}\n{FILE_HEADER_PREFIX}{file_info.relative_path_posix}\n{separator_line}\n\n"
-            buffer.write(header_content)
-            try:
-                with open(
-                    file_info.absolute_path, "r", encoding=encoding, errors="replace"
-                ) as infile:
-                    file_content = infile.read()
-                    buffer.write(file_content)
-                buffer.write("\n\n")
-            except Exception:
-                buffer.write(
-                    f"Error: Could not read file '{file_info.relative_path_posix}'.\n\n"
-                )
-
-    # Get the complete content from the buffer
-    final_content = buffer.getvalue()
-    total_token_count = 0
-    mode_display = "Characters" if TOKEN_APPROX_MODE == "CHAR_COUNT" else "Words"
-
-    if show_token_count:
-        if TOKEN_APPROX_MODE == "CHAR_COUNT":
-            total_token_count = len(final_content)
-        elif TOKEN_APPROX_MODE == "WORD_COUNT":
-            total_token_count = len(final_content.split())
-
-    # Now, write everything to the actual file
+    thread_id = threading.get_ident()
+    activity[thread_id] = file_path.name
     try:
-        with open(output_file_path, "w", encoding=encoding) as outfile:
-            if show_token_count:
-                # Add the token count at the top of the file as requested
-                outfile.write(f"Token Count ({mode_display}): {total_token_count}\n\n")
+        compare_target = str(file_path) if full_path else file_path.name
+        if any(key in compare_target.lower() for key in keywords):
+            return file_path
 
-            # Write the main content
-            outfile.write(final_content)
-    except IOError as e:
-        print(f"\nError: Could not write to output file '{output_file_path}': {e}")
-        return
-
-    # Final console output for user feedback
-    if mode == ProjectMode.SEARCH:
-        if files_to_process:
-            print("\nSuccess! Collation complete.")
-    else:  # Filter mode has its own messaging pattern
-        print(f"\nProcess complete. Output written to: {output_file_path}")
-        if len(files_to_process) > 0:
-            print(
-                f"Summary: {len(files_to_process)} files selected for content processing."
-            )
-
-    if show_token_count:
-        print(f"Total Approximated Tokens ({mode_display}): {total_token_count}")
-
-
-def filter_and_append_content(
-    root_dir: Path,
-    output_file_path_str: str,
-    tree_style: TreeStyle,
-    generate_tree: bool,
-    file_types: Optional[List[str]],
-    whitelist_substrings_in_filename: Optional[List[str]],
-    ignore_substrings_in_filename: Optional[List[str]],
-    ignore_dirs_in_path: Optional[List[str]],
-    language_presets: Optional[List[LanguagePreset]],
-    ignore_presets: Optional[List[IgnorePreset]],
-    encoding: str,
-    separator_char: str,
-    separator_line_len: int,
-    show_token_count: bool,
-    show_tree_stats: bool,
-) -> None:
-    """FILTER MODE: Selects files based on explicit criteria and prepares content/tree."""
-    criteria = FilterCriteria.normalize_inputs(
-        file_types,
-        whitelist_substrings_in_filename,
-        ignore_substrings_in_filename,
-        ignore_dirs_in_path,
-        language_presets,
-        ignore_presets,
-    )
-    tree_content_lines: Optional[List[str]] = (
-        _generate_tree_lines(root_dir, criteria, tree_style, show_tree_stats)
-        if generate_tree
-        else None
-    )
-    files_to_process: List[FileToProcess] = []
-    for dirpath_str, dirnames, filenames in os.walk(str(root_dir), topdown=True):
-        current_dir_path = Path(dirpath_str)
-        orig_dirnames = list(dirnames)
-        dirnames[:] = []
-        for d_name in orig_dirnames:
-            dir_abs_path = current_dir_path / d_name
-            if _should_include_entry(dir_abs_path, root_dir, criteria, is_dir=True):
-                dirnames.append(d_name)
-        for filename in filenames:
-            file_abs_path = current_dir_path / filename
-            if _should_include_entry(file_abs_path, root_dir, criteria, is_dir=False):
-                files_to_process.append(
-                    FileToProcess(
-                        file_abs_path, file_abs_path.relative_to(root_dir).as_posix()
-                    )
-                )
-    files_to_process.sort(key=lambda f_info: f_info.relative_path_posix.lower())
-    _collate_content_to_file(
-        output_file_path_str,
-        tree_content_lines,
-        files_to_process,
-        encoding,
-        separator_char,
-        separator_line_len,
-        show_token_count,
-        show_tree_stats,
-        ProjectMode.FILTER,
-    )
-
-
-def search_and_collate_content(
-    root_dir: Path,
-    sub_string_match: List[str],
-    output_file: str,
-    tree_style: TreeStyle,
-    file_extensions_to_check: Optional[List[str]],
-    ignore_substrings_in_path: Optional[List[str]],
-    language_presets: Optional[List[LanguagePreset]],
-    ignore_presets: Optional[List[IgnorePreset]],
-    search_file_contents: bool,
-    max_workers: Optional[int],
-    full_path_compare: bool,
-    show_token_count: bool,
-    show_tree_stats: bool,
-) -> None:
-    """SEARCH MODE: Scans for files that match a substring in their path/name or content."""
-    criteria = FilterCriteria.normalize_inputs(
-        file_extensions_to_check,
-        None,
-        None,
-        ignore_substrings_in_path,
-        language_presets,
-        ignore_presets,
-    )
-    normalized_keywords = [
-        sub.lower().strip() for sub in sub_string_match if sub.strip()
-    ]
-    if not normalized_keywords:
-        print("Error: Search mode requires 'search_keywords' to be provided.")
-        return
-
-    print("Phase 1: Finding all matching files...")
-    if criteria.ignore_path_components:
-        print(
-            f"Ignoring directories and files containing: {', '.join(criteria.ignore_path_components)}"
-        )
-
-    candidate_files: List[Path] = []
-    for dirpath_str, dirnames, filenames in os.walk(str(root_dir), topdown=True):
-        current_dir_path = Path(dirpath_str)
-        # Prune directories based on ignore criteria
-        dirnames[:] = [
-            d
-            for d in dirnames
-            if (current_dir_path / d).name.lower()
-            not in criteria.ignore_path_components
-        ]
-
-        for filename in filenames:
-            file_abs_path = current_dir_path / filename
-            # Also ignore individual files based on path components
+        if search_content and (
+            read_binary_files or file_path.suffix.lower() not in BINARY_FILE_EXTENSIONS
+        ):
             try:
-                relative_parts = file_abs_path.relative_to(root_dir).parts
-                if any(
-                    part.lower() in criteria.ignore_path_components
-                    for part in relative_parts
-                ):
-                    continue
-            except ValueError:
-                continue
+                with file_path.open("r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if any(key in line.lower() for key in keywords):
+                            return file_path
+            except OSError:
+                pass
+        return None
+    finally:
+        activity[thread_id] = ""
 
-            if (
-                not criteria.file_extensions
-                or file_abs_path.suffix.lower() in criteria.file_extensions
-            ):
-                candidate_files.append(file_abs_path)
 
-    matched_files: Set[Path] = set()
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+def _process_files_concurrently(
+    files: List[Path],
+    keywords: List[str],
+    search_content: bool,
+    full_path: bool,
+    max_workers: Optional[int],
+    progress: Any,
+    task_id: Any,
+    read_binary_files: bool,
+) -> Set[Path]:
+    """
+    Uses a thread pool to process a list of files for search matches concurrently.
+
+    Args:
+        files (List[Path]): The list of candidate files to search through.
+        keywords (List[str]): The keywords to search for.
+        search_content (bool): Whether to search inside file contents.
+        full_path (bool): Whether to compare keywords against the full path.
+        max_workers (Optional[int]): The maximum number of threads to use.
+        progress (Any): The progress bar object.
+        task_id (Any): The ID of the processing task on the progress bar.
+        read_binary_files (bool): If True, search the content of binary files.
+
+    Returns:
+        Set[Path]: A set of absolute paths for all files that matched.
+    """
+    matched_files, thread_activity = set(), {}
+    with ThreadPoolExecutor(
+        max_workers=max_workers or (os.cpu_count() or 1) + 4,
+        thread_name_prefix="scanner",
+    ) as executor:
         future_to_file = {
             executor.submit(
                 process_file_for_search,
-                file,
-                normalized_keywords,
-                search_file_contents,
-                full_path_compare,
-            ): file
-            for file in candidate_files
+                f,
+                keywords,
+                search_content,
+                full_path,
+                thread_activity,
+                read_binary_files,
+            ): f
+            for f in files
         }
-        progress_bar = tqdm(
-            as_completed(future_to_file),
-            total=len(candidate_files),
-            unit="file",
-            desc="Scanning",
-        )
-        for future in progress_bar:
-            result = future.result()
-            if result:
+        for future in as_completed(future_to_file):
+            if progress:
+                active_threads = {
+                    f"T{str(tid)[-3:]}": name
+                    for tid, name in thread_activity.items()
+                    if name
+                }
+                progress.update(
+                    task_id,
+                    advance=1,
+                    description=f"Processing [yellow]{len(active_threads)} threads[/yellow]",
+                )
+                if RICH_AVAILABLE:
+                    status_panel = Panel(
+                        Text(
+                            "\n".join(
+                                f"[bold cyan]{k}[/]: {v}"
+                                for k, v in active_threads.items()
+                            )
+                        ),
+                        border_style="dim",
+                        title="[dim]Thread Activity",
+                    )
+                    progress.update(task_id, status=status_panel)
+            if result := future.result():
                 matched_files.add(result)
-
-    if not matched_files:
-        print("\nScan complete. No matching files were found.")
-        # Still create the output file with a "not found" message
-        with open(output_file, "w", encoding=DEFAULT_ENCODING) as f_out:
-            f_out.write("No files found matching the specified criteria.\n")
-        return
-
-    sorted_matched_files = sorted(
-        list(matched_files), key=lambda p: p.relative_to(root_dir).as_posix().lower()
-    )
-
-    print(f"\nPhase 1 Complete: Found {len(sorted_matched_files)} matching files.")
-    print(f"\nPhase 2: Generating output file at '{Path(output_file).resolve()}'...")
-
-    tree_content_lines = _generate_tree_from_paths(
-        root_dir, sorted_matched_files, tree_style, show_tree_stats
-    )
-    files_to_process = [
-        FileToProcess(f, f.relative_to(root_dir).as_posix())
-        for f in sorted_matched_files
-    ]
-    _collate_content_to_file(
-        output_file,
-        tree_content_lines,
-        files_to_process,
-        DEFAULT_ENCODING,
-        DEFAULT_SEPARATOR_CHAR,
-        DEFAULT_SEPARATOR_LINE_LENGTH,
-        show_token_count,
-        show_tree_stats,
-        ProjectMode.SEARCH,
-    )
+    if progress and RICH_AVAILABLE:
+        progress.update(task_id, status="[bold green]Done![/bold green]")
+    return matched_files
 
 
-# --- DECONSTRUCTION FUNCTION ---
+def _generate_tree_with_stats(
+    root_dir: Path, file_paths: List[Path], show_stats: bool
+) -> List[str]:
+    """
+    Generates a directory tree structure from a list of file paths.
+
+    Args:
+        root_dir (Path): The root directory of the project, used as the tree's base.
+        file_paths (List[Path]): A list of file paths to include in the tree.
+        show_stats (bool): If True, include file and directory counts in the tree.
+
+    Returns:
+        List[str]: A list of strings, where each string is a line in the tree.
+    """
+    tree_dict: Dict[str, Any] = {}
+    for path in file_paths:
+        level = tree_dict
+        for part in path.relative_to(root_dir).parts:
+            level = level.setdefault(part, {})
+
+    def count_children(d: Dict) -> Tuple[int, int]:
+        files = sum(1 for v in d.values() if not v)
+        dirs = len(d) - files
+        return files, dirs
+
+    lines = []
+    style = ("├── ", "└── ", "│   ", "    ")
+
+    def build_lines_recursive(d: Dict, prefix: str = ""):
+        items = sorted(d.keys(), key=lambda k: (not d[k], k.lower()))
+        for i, name in enumerate(items):
+            is_last = i == len(items) - 1
+            connector = style[1] if is_last else style[0]
+            display_name = name
+
+            if d[name]:
+                if show_stats:
+                    files, dirs = count_children(d[name])
+                    display_name += f" [dim][M: {files}f, {dirs}d][/dim]"
+
+            lines.append(f"{prefix}{connector}{display_name}")
+
+            if d[name]:
+                extension = style[3] if is_last else style[2]
+                build_lines_recursive(d[name], prefix + extension)
+
+    root_name = f"[bold cyan]{root_dir.name}[/bold cyan]"
+    if show_stats:
+        files, dirs = count_children(tree_dict)
+        root_name += f" [dim][M: {files}f, {dirs}d][/dim]"
+    lines.append(root_name)
+
+    build_lines_recursive(tree_dict)
+    return lines
 
 
-def deconstruct_snapshot(snapshot_file_path: str) -> Dict[str, Any]:
-    """Scans a compiled snapshot file, extracts the directory tree lines and file paths."""
-    snapshot_path = Path(snapshot_file_path)
-    if not snapshot_path.is_file():
-        raise FileNotFoundError(f"Snapshot file not found: {snapshot_file_path}")
-    tree_lines: List[str] = []
-    file_paths: List[str] = []
-    separator_pattern = re.compile(
-        r"^[{}]{{4,}}[{}|]*$".format(
-            re.escape(DEFAULT_SEPARATOR_CHAR), re.escape(DEFAULT_SEPARATOR_CHAR)
+def _collate_content_to_file(
+    output_path: Path,
+    tree_lines: List,
+    files: List[FileToProcess],
+    show_tree_stats: bool,
+    show_token_count: bool,
+    exclude_whitespace: bool,
+    progress: Any,
+    task_id: Any,
+) -> Tuple[float, int]:
+    """
+    Collates the file tree and file contents into a single output file.
+
+    Args:
+        output_path (Path): The path to the final output file.
+        tree_lines (List): The generated file tree lines.
+        files (List[FileToProcess]): The files whose content needs to be collated.
+        show_tree_stats (bool): Whether to include the stats key in the header.
+        show_token_count (bool): Whether to calculate and include the token count.
+        exclude_whitespace (bool): If True, exclude whitespace from token counting.
+        progress (Any): The progress bar object.
+        task_id (Any): The ID of the collation task on the progress bar.
+
+    Returns:
+        Tuple[float, int]: A tuple containing the total bytes written and the token count.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    buffer, total_bytes, token_count = StringIO(), 0, 0
+
+    if tree_lines:
+        buffer.write(f"{TREE_HEADER_TEXT}\n" + "-" * 80 + "\n\n")
+        if show_tree_stats:
+            buffer.write(
+                "Key: [M: Matched files/dirs]\n     (f=files, d=directories)\n\n"
+            )
+
+        if RICH_AVAILABLE:
+            content = "\n".join(Text.from_markup(line).plain for line in tree_lines)
+        else:
+            content = "\n".join(tree_lines)
+        buffer.write(content + "\n\n")
+
+    for file_info in files:
+        if progress:
+            progress.update(
+                task_id,
+                advance=1,
+                description=f"Collating [green]{file_info.relative_path_posix}[/green]",
+            )
+        buffer.write(f"{'-'*80}\nFILE: {file_info.relative_path_posix}\n{'-'*80}\n\n")
+        try:
+            content = file_info.absolute_path.read_text(
+                encoding=DEFAULT_ENCODING, errors="replace"
+            )
+            buffer.write(content + "\n\n")
+            total_bytes += len(content.encode(DEFAULT_ENCODING))
+        except Exception as e:
+            buffer.write(f"Error: Could not read file. Issue: {e}\n\n")
+
+    final_content = buffer.getvalue()
+    if show_token_count:
+        content_for_count = (
+            re.sub(r"\s", "", final_content) if exclude_whitespace else final_content
         )
-    )
-    state = "LOOKING_FOR_TREE"
-    with open(snapshot_path, "r", encoding=DEFAULT_ENCODING, errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if state == "LOOKING_FOR_TREE":
-                if line == TREE_HEADER_TEXT:
-                    state = "READING_TREE"
-            elif state == "READING_TREE":
-                if not line or separator_pattern.match(line):
-                    if tree_lines and separator_pattern.match(line):
-                        state = "LOOKING_FOR_CONTENT"
-                    continue
-                if state == "READING_TREE" and not line.startswith("Key:"):
-                    tree_lines.append(line)
-            elif state == "LOOKING_FOR_CONTENT":
-                if line.startswith(FILE_HEADER_PREFIX):
-                    file_paths.append(line[len(FILE_HEADER_PREFIX) :].strip())
-                    state = "READING_CONTENT"
-            elif state == "READING_CONTENT":
-                if line.startswith(FILE_HEADER_PREFIX):
-                    file_paths.append(line[len(FILE_HEADER_PREFIX) :].strip())
-    # Post-process to remove the key lines if they were accidentally captured
-    tree_lines = [
-        line
-        for line in tree_lines
-        if not line.strip().startswith("Key:")
-        and not line.strip().startswith("(f=files")
-    ]
-    return {"tree_lines": tree_lines, "file_paths": file_paths}
+        token_count = len(content_for_count)
+
+    with output_path.open("w", encoding=DEFAULT_ENCODING) as outfile:
+        if show_token_count:
+            mode = "chars, no whitespace" if exclude_whitespace else "characters"
+            outfile.write(f"Token Count ({mode}): {token_count}\n\n")
+        outfile.write(final_content)
+
+    return total_bytes, token_count
 
 
-# --- UNIFIED ENTRY POINT AND UTILITY WRAPPERS ---
-
-
-def process_project(
-    root_dir_param: Optional[str] = None,
-    output_file_name: str = "project_output.txt",
-    mode: ProjectMode = ProjectMode.FILTER,
-    file_types: Optional[List[str]] = None,
-    ignore_dirs_in_path: Optional[List[str]] = None,
+# --- Main Entry Point ---
+def generate_snapshot(
+    root_directory: str = ".",
+    output_file_name: str = "project_snapshot.txt",
+    search_keywords: Optional[List[str]] = None,
+    file_extensions: Optional[List[str]] = None,
+    ignore_if_in_path: Optional[List[str]] = None,
+    ignore_extensions: Optional[List[str]] = None,
     language_presets: Optional[List[LanguagePreset]] = None,
     ignore_presets: Optional[List[IgnorePreset]] = None,
-    whitelist_filename_substrings: Optional[List[str]] = None,
-    ignore_filename_substrings: Optional[List[str]] = None,
-    generate_tree: bool = True,
-    search_keywords: Optional[List[str]] = None,
-    search_file_contents: bool = False,
+    search_file_contents: bool = True,
     full_path_compare: bool = True,
     max_workers: Optional[int] = None,
-    tree_style_preset: TreeStylePreset = TreeStylePreset.UNICODE,
-    tree_style_t_connector: Optional[str] = None,
-    tree_style_l_connector: Optional[str] = None,
-    tree_style_v_connector: Optional[str] = None,
-    tree_style_h_spacer: Optional[str] = None,
-    show_token_count: bool = False,
-    show_tree_stats: bool = False,
-    encoding: str = DEFAULT_ENCODING,
-    separator_char: str = DEFAULT_SEPARATOR_CHAR,
-    separator_line_len: int = DEFAULT_SEPARATOR_LINE_LENGTH,
-) -> None:
-    """Main function to process a project directory in either FILTER or SEARCH mode."""
-    actual_root_dir = validate_root_directory(root_dir_param)
-    if actual_root_dir is None:
-        sys.exit(1)
-    style = tree_style_preset.to_style()
-    final_style = TreeStyle(
-        t_connector=tree_style_t_connector or style.t_connector,
-        l_connector=tree_style_l_connector or style.l_connector,
-        v_connector=tree_style_v_connector or style.v_connector,
-        h_spacer=tree_style_h_spacer or style.h_spacer,
-    )
-    print(f"--- Starting Project Processing in {mode.name} Mode ---")
-    if mode == ProjectMode.FILTER:
-        filter_and_append_content(
-            actual_root_dir,
-            output_file_name,
-            final_style,
-            generate_tree,
-            file_types,
-            whitelist_filename_substrings,
-            ignore_filename_substrings,
-            ignore_dirs_in_path,
-            language_presets,
-            ignore_presets,
-            encoding,
-            separator_char,
-            separator_line_len,
-            show_token_count,
-            show_tree_stats,
-        )
-    elif mode == ProjectMode.SEARCH:
-        if not search_keywords:
-            print("Error: Search mode requires 'search_keywords' to be provided.")
-            return
-        search_and_collate_content(
-            actual_root_dir,
-            search_keywords,
-            output_file_name,
-            final_style,
-            file_types,
-            ignore_dirs_in_path,
-            language_presets,
-            ignore_presets,
-            search_file_contents,
-            max_workers,
-            full_path_compare,
-            show_token_count,
-            show_tree_stats,
-        )
-    print("--- Script Execution Finished ---")
-
-
-def filter_project(
-    root_dir_param: Optional[str] = None,
-    output_file_name: str = "project_filter_output.txt",
-    file_types: Optional[List[str]] = None,
-    ignore_dirs_in_path: Optional[List[str]] = None,
-    language_presets: Optional[List[LanguagePreset]] = None,
-    ignore_presets: Optional[List[IgnorePreset]] = None,
-    whitelist_filename_substrings: Optional[List[str]] = None,
-    ignore_filename_substrings: Optional[List[str]] = None,
     generate_tree: bool = True,
-    tree_style_preset: TreeStylePreset = TreeStylePreset.UNICODE,
-    tree_style_t_connector: Optional[str] = None,
-    tree_style_l_connector: Optional[str] = None,
-    tree_style_v_connector: Optional[str] = None,
-    tree_style_h_spacer: Optional[str] = None,
-    show_token_count: bool = False,
     show_tree_stats: bool = False,
-    encoding: str = DEFAULT_ENCODING,
-    separator_char: str = DEFAULT_SEPARATOR_CHAR,
-    separator_line_len: int = DEFAULT_SEPARATOR_LINE_LENGTH,
-) -> None:
-    """Utility wrapper for process_project in FILTER mode."""
-    process_project(
-        root_dir_param=root_dir_param,
-        output_file_name=output_file_name,
-        mode=ProjectMode.FILTER,
-        file_types=file_types,
-        ignore_dirs_in_path=ignore_dirs_in_path,
-        language_presets=language_presets,
-        ignore_presets=ignore_presets,
-        whitelist_filename_substrings=whitelist_filename_substrings,
-        ignore_filename_substrings=ignore_filename_substrings,
-        generate_tree=generate_tree,
-        tree_style_preset=tree_style_preset,
-        tree_style_t_connector=tree_style_t_connector,
-        tree_style_l_connector=tree_style_l_connector,
-        tree_style_v_connector=tree_style_v_connector,
-        tree_style_h_spacer=tree_style_h_spacer,
-        show_token_count=show_token_count,
-        show_tree_stats=show_tree_stats,
-        encoding=encoding,
-        separator_char=separator_char,
-        separator_line_len=separator_line_len,
-    )
-
-
-def find_in_project(
-    root_dir_param: Optional[str] = None,
-    output_file_name: str = "project_search_output.txt",
-    search_keywords: Optional[List[str]] = None,
-    file_extensions_to_check: Optional[List[str]] = None,
-    ignore_dirs_in_path: Optional[List[str]] = None,
-    language_presets: Optional[List[LanguagePreset]] = None,
-    ignore_presets: Optional[List[IgnorePreset]] = None,
-    search_file_contents: bool = False,
-    full_path_compare: bool = True,
-    max_workers: Optional[int] = None,
-    tree_style_preset: TreeStylePreset = TreeStylePreset.UNICODE,
-    tree_style_t_connector: Optional[str] = None,
-    tree_style_l_connector: Optional[str] = None,
-    tree_style_v_connector: Optional[str] = None,
-    tree_style_h_spacer: Optional[str] = None,
     show_token_count: bool = False,
-    show_tree_stats: bool = False,
-    encoding: str = DEFAULT_ENCODING,
-    separator_char: str = DEFAULT_SEPARATOR_CHAR,
-    separator_line_len: int = DEFAULT_SEPARATOR_LINE_LENGTH,
+    exclude_whitespace_in_token_count: bool = False,
+    read_binary_files: bool = False,
 ) -> None:
-    """Utility wrapper for process_project in SEARCH mode."""
-    if not search_keywords:
-        print("Error: 'search_keywords' must be provided for find_in_project.")
+    """
+    Orchestrates the entire process of scanning, filtering, and collating project files.
+
+    This function serves as the main entry point for the utility. It can be used
+    to create a full "snapshot" of a project's source code or to search for
+    specific keywords within file names and/or contents. It is highly configurable
+    through presets and manual overrides.
+
+    Args:
+        root_directory (str): The starting directory for the scan. Defaults to ".".
+        output_file_name (str): The name of the file to save the results to.
+            Defaults to "project_snapshot.txt".
+        search_keywords (List[str], optional): A list of keywords to search for. If
+            None or empty, the function runs in "snapshot" mode, including all
+            files that match the other criteria. Defaults to None.
+        file_extensions (List[str], optional): A list of specific file
+            extensions to include (e.g., [".py", ".md"]). Defaults to None.
+        ignore_if_in_path (List[str], optional): A list of directory or file
+            names to exclude from the scan. Defaults to None.
+        ignore_extensions (List[str], optional): A list of file extensions to
+            explicitly ignore (e.g., [".log", ".tmp"]). Defaults to None.
+        language_presets (List[LanguagePreset], optional): A list of LanguagePreset
+            enums for common file types (e.g., [LanguagePreset.PYTHON]). Defaults to None.
+        ignore_presets (List[IgnorePreset], optional): A list of IgnorePreset enums
+            for common ignore patterns (e.g., [IgnorePreset.PYTHON]). Defaults to None.
+        search_file_contents (bool): If True, search for keywords within file
+            contents. Defaults to True.
+        full_path_compare (bool): If True, search for keywords in the full file path,
+            not just the filename. Defaults to True.
+        max_workers (Optional[int]): The maximum number of worker threads for
+            concurrent processing. Defaults to CPU count + 4.
+        generate_tree (bool): If True, a file tree of the matched files will be
+            included at the top of the output file. Defaults to True.
+        show_tree_stats (bool): If True, display file and directory counts in the
+            generated tree. Defaults to False.
+        show_token_count (bool): If True, display an approximated token count in the
+            summary and output file. Defaults to False.
+        exclude_whitespace_in_token_count (bool): If True, whitespace is removed
+            before counting tokens, giving a more compact count. Defaults to False.
+        read_binary_files (bool): If True, the content search will attempt to read
+            and search through binary files. Defaults to False.
+    """
+    console, start_time = ConsoleManager(), time.perf_counter()
+    root_dir = Path(root_directory or ".").resolve()
+    if not root_dir.is_dir():
+        console.log(f"Error: Root directory '{root_dir}' not found.", style="bold red")
         return
-    process_project(
-        root_dir_param=root_dir_param,
-        output_file_name=output_file_name,
-        mode=ProjectMode.SEARCH,
-        file_types=file_extensions_to_check,
-        ignore_dirs_in_path=ignore_dirs_in_path,
-        language_presets=language_presets,
+
+    keywords = [k.lower().strip() for k in search_keywords or [] if k.strip()]
+    snapshot_mode = not keywords
+    criteria = FilterCriteria.normalize_inputs(
+        file_types=file_extensions,
+        ignore_if_in_path=ignore_if_in_path,
+        ignore_extensions=ignore_extensions,
+        lang_presets=language_presets,
         ignore_presets=ignore_presets,
-        search_keywords=search_keywords,
-        search_file_contents=search_file_contents,
-        full_path_compare=full_path_compare,
-        max_workers=max_workers,
-        tree_style_preset=tree_style_preset,
-        tree_style_t_connector=tree_style_t_connector,
-        tree_style_l_connector=tree_style_l_connector,
-        tree_style_v_connector=tree_style_v_connector,
-        tree_style_h_spacer=tree_style_h_spacer,
-        show_token_count=show_token_count,
-        show_tree_stats=show_tree_stats,
-        encoding=encoding,
-        separator_char=separator_char,
-        separator_line_len=separator_line_len,
     )
 
+    config_rows = [
+        ["Root Directory", str(root_dir)],
+        ["File Types", ", ".join(criteria.file_extensions) or "All"],
+        ["Ignore Paths", ", ".join(criteria.ignore_if_in_path) or "None"],
+        ["Ignore Extensions", ", ".join(criteria.ignore_extensions) or "None"],
+        ["Generate Tree", "[green]Yes[/green]" if generate_tree else "[red]No[/red]"],
+    ]
+    if generate_tree:
+        config_rows.append(
+            ["Tree Stats", "[green]Yes[/green]" if show_tree_stats else "[red]No[/red]"]
+        )
+    config_rows.append(
+        [
+            "Show Token Count",
+            "[green]Yes[/green]" if show_token_count else "[red]No[/red]",
+        ]
+    )
+    if show_token_count:
+        config_rows.append(
+            [
+                "Exclude Whitespace",
+                (
+                    "[green]Yes[/green]"
+                    if exclude_whitespace_in_token_count
+                    else "[red]No[/red]"
+                ),
+            ]
+        )
 
-__all__ = [
-    "process_project",
-    "filter_project",
-    "find_in_project",
-    "deconstruct_snapshot",
-    "ProjectMode",
-    "LanguagePreset",
-    "IgnorePreset",
-    "TreeStylePreset",
-]
+    if snapshot_mode:
+        config_rows.insert(1, ["Mode", "[bold blue]Snapshot[/bold blue]"])
+    else:
+        config_rows.insert(1, ["Mode", "[bold yellow]Search[/bold yellow]"])
+        config_rows.insert(
+            2, ["Search Keywords", f"[yellow]{', '.join(keywords)}[/yellow]"]
+        )
+        config_rows.append(
+            [
+                "Search Content",
+                "[green]Yes[/green]" if search_file_contents else "[red]No[/red]",
+            ]
+        )
+        config_rows.append(
+            [
+                "Read Binary Files",
+                "[green]Yes[/green]" if read_binary_files else "[red]No[/red]",
+            ]
+        )
+    console.print_table(
+        "Project Scan Configuration", ["Parameter", "Value"], config_rows
+    )
+
+    @contextmanager
+    def progress_manager():
+        if RICH_AVAILABLE:
+            progress = Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                SpinnerColumn(),
+                TimeElapsedColumn(),
+                "{task.fields[status]}",
+                expand=True,
+            )
+            with Live(progress, console=console.console, refresh_per_second=10) as live:
+                yield progress
+        else:
+            with FallbackProgress() as progress:
+                yield progress
+
+    with progress_manager() as progress:
+        discover_task = progress.add_task("Discovering files", total=None, status="")
+        candidate_files = _discover_files(root_dir, criteria, progress, discover_task)
+        if RICH_AVAILABLE:
+            progress.update(
+                discover_task,
+                description=f"Discovered [bold green]{len(candidate_files)}[/bold green] candidates",
+                status="",
+            )
+        else:
+            progress.update(
+                discover_task,
+                description=f"Discovered {len(candidate_files)} candidates",
+            )
+
+        matched_files = set()
+        if candidate_files:
+            if snapshot_mode:
+                matched_files = set(candidate_files)
+                if RICH_AVAILABLE:
+                    progress.add_task(
+                        "[dim]Keyword Processing[/dim]",
+                        total=1,
+                        completed=1,
+                        status="[bold blue](Snapshot Mode)[/bold blue]",
+                    )
+            else:
+                process_task = progress.add_task(
+                    f"Processing {len(candidate_files)} files",
+                    total=len(candidate_files),
+                    status="",
+                )
+                matched_files = _process_files_concurrently(
+                    candidate_files,
+                    keywords,
+                    search_file_contents,
+                    full_path_compare,
+                    max_workers,
+                    progress,
+                    process_task,
+                    read_binary_files,
+                )
+
+        output_path, total_bytes, token_count = None, 0, 0
+        if matched_files:
+            sorted_files = sorted(
+                list(matched_files), key=lambda p: p.relative_to(root_dir).as_posix()
+            )
+            tree_lines = []
+            if generate_tree:
+                tree_task = progress.add_task(
+                    "Generating file tree...", total=1, status=""
+                )
+                tree_lines = _generate_tree_with_stats(
+                    root_dir, sorted_files, show_tree_stats
+                )
+                progress.update(
+                    tree_task, completed=1, description="Generated file tree"
+                )
+
+            collate_task = progress.add_task(
+                f"Collating {len(sorted_files)} files",
+                total=len(sorted_files),
+                status="",
+            )
+            files_to_process = [
+                FileToProcess(f, f.relative_to(root_dir).as_posix())
+                for f in sorted_files
+            ]
+            output_path = Path(output_file_name).resolve()
+            total_bytes, token_count = _collate_content_to_file(
+                output_path,
+                tree_lines,
+                files_to_process,
+                show_tree_stats,
+                show_token_count,
+                exclude_whitespace_in_token_count,
+                progress,
+                collate_task,
+            )
+
+    end_time = time.perf_counter()
+    summary_rows = [
+        ["Candidate Files", f"{len(candidate_files)}"],
+        ["Files Matched", f"[bold green]{len(matched_files)}[/bold green]"],
+        ["Total Time", f"{end_time - start_time:.2f} seconds"],
+        ["Output Size", f"{total_bytes / 1024:.2f} KB"],
+    ]
+    if show_token_count:
+        summary_rows.append(["Approximated Tokens", f"{token_count:,}"])
+    summary_rows.append(["Output File", str(output_path or "N/A")])
+    console.print_table("Scan Complete", ["Metric", "Value"], summary_rows)
+
 
 if __name__ == "__main__":
-    # --- Example: Scan with Custom Filters and the New Readable Stats ---
-    print("\n--- Running a custom filter scan with new stats format ---")
-    filter_project(
-        root_dir_param=".",
-        output_file_name="custom_snapshot_readable.txt",
-        file_types=[".py", "requirements.txt", ".sql", ".md"],
-        ignore_dirs_in_path=["venv", "build", "node_modules", "static", "templates"],
+    generate_snapshot(
+        root_directory=".",
+        output_file_name="project_snapshot_final.txt",
+        # No search keywords triggers Snapshot Mode
+        language_presets=[LanguagePreset.PYTHON],
+        ignore_presets=[
+            IgnorePreset.PYTHON,
+            IgnorePreset.BUILD_ARTIFACTS,
+            IgnorePreset.VERSION_CONTROL,
+            IgnorePreset.NODE_JS,
+            IgnorePreset.IDE_METADATA,
+        ],
+        ignore_extensions=[".log", ".tmp"],  # Example of new functionality
+        generate_tree=True,
         show_tree_stats=True,
         show_token_count=True,
+        exclude_whitespace_in_token_count=True,
     )
